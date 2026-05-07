@@ -16,6 +16,8 @@ ENV/
 .env
 .env.*
 !.env.example
+.streamlit/secrets.toml
+.cache/
 
 # Build and packaging outputs
 build/
@@ -38,7 +40,29 @@ logs/
 *.orig
 
 # Machine learning artifacts
-models/
+models/*
+!models/base_bert_base_chinese/
+!models/base_bert_base_chinese/**
+!models/bert_weibo/
+models/bert_weibo/*
+!models/bert_weibo/best_model/
+!models/bert_weibo/best_model/**
+!models/macbert_weibo/
+models/macbert_weibo/*
+!models/macbert_weibo/best_model/
+!models/macbert_weibo/best_model/**
+!models/roberta_weibo/
+models/roberta_weibo/*
+!models/roberta_weibo/best_model/
+!models/roberta_weibo/best_model/**
+!models/bert_bigru_weibo/
+models/bert_bigru_weibo/*
+!models/bert_bigru_weibo/best_model/
+!models/bert_bigru_weibo/best_model/**
+!models/bert_lora_weibo/
+models/bert_lora_weibo/*
+!models/bert_lora_weibo/best_model/
+!models/bert_lora_weibo/best_model/**
 checkpoints/
 runs/
 wandb/
@@ -47,6 +71,8 @@ mlruns/
 *.pth
 *.bin
 *.safetensors
+!models/base_bert_base_chinese/*.safetensors
+!models/**/best_model/*.safetensors
 
 # Local datasets and generated data
 data/

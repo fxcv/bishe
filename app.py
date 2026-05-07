@@ -3,14 +3,16 @@ os.environ["TRANSFORMERS_DISABLE_AUTO_CONVERSION"] = "1"
 
 import re
 import random
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
 import torch
 import torch.nn as nn
 import altair as alt
+from huggingface_hub import snapshot_download
 from transformers import (
     AutoTokenizer,
     AutoModel,
@@ -28,11 +30,12 @@ except Exception:
 # =========================
 # 基础配置
 # =========================
-PROJECT_DIR = Path(r"D:\Users\30126\Desktop\project")
-MODELS_DIR = PROJECT_DIR / "models"
+PROJECT_DIR = Path(__file__).resolve().parent
+MODELS_DIR = Path(os.getenv("SENTIMENT_MODELS_DIR", str(PROJECT_DIR / "models"))).expanduser()
 
 # 离线底座模型目录
 LOCAL_BASE_BERT_DIR = MODELS_DIR / "base_bert_base_chinese"
+PUBLIC_BASE_BERT_MODEL = "bert-base-chinese"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LENGTH = 128
@@ -42,22 +45,43 @@ st.set_page_config(
     layout="wide",
 )
 
-if "cache_cleared_once" not in st.session_state:
-    st.cache_resource.clear()
-    st.session_state["cache_cleared_once"] = True
-
 
 # =========================
 # 模型目录
 # 这里已经全部切成 weibo 数据集训练出的模型
 # 如果你的真实文件夹名不一样，只改下面这 5 行
 # =========================
+MODEL_SPECS: Dict[str, Dict[str, str]] = {
+    "BERT": {
+        "local_subdir": "bert_weibo/best_model",
+        "repo_secret": "bert",
+        "repo_env": "HF_REPO_BERT",
+    },
+    "MacBERT": {
+        "local_subdir": "macbert_weibo/best_model",
+        "repo_secret": "macbert",
+        "repo_env": "HF_REPO_MACBERT",
+    },
+    "RoBERTa-wwm-ext": {
+        "local_subdir": "roberta_weibo/best_model",
+        "repo_secret": "roberta",
+        "repo_env": "HF_REPO_ROBERTA",
+    },
+    "BERT+BiGRU": {
+        "local_subdir": "bert_bigru_weibo/best_model",
+        "repo_secret": "bert_bigru",
+        "repo_env": "HF_REPO_BERT_BIGRU",
+    },
+    "BERT+LoRA": {
+        "local_subdir": "bert_lora_weibo/best_model",
+        "repo_secret": "bert_lora",
+        "repo_env": "HF_REPO_BERT_LORA",
+    },
+}
+
 MODEL_PATHS: Dict[str, Path] = {
-    "BERT": MODELS_DIR / "bert_weibo" / "best_model",
-    "MacBERT": MODELS_DIR / "macbert_weibo" / "best_model",
-    "RoBERTa-wwm-ext": MODELS_DIR / "roberta_weibo" / "best_model",
-    "BERT+BiGRU": MODELS_DIR / "bert_bigru_weibo" / "best_model",
-    "BERT+LoRA": MODELS_DIR / "bert_lora_weibo" / "best_model",
+    model_name: MODELS_DIR / spec["local_subdir"]
+    for model_name, spec in MODEL_SPECS.items()
 }
 
 # =========================
@@ -106,12 +130,89 @@ def fill_random_example():
     st.session_state.single_text = random.choice(RANDOM_EXAMPLES)
 
 
-def ensure_local_base_exists():
-    if not LOCAL_BASE_BERT_DIR.exists():
-        raise FileNotFoundError(
-            f"离线底座模型不存在：{LOCAL_BASE_BERT_DIR}\n"
-            f"请先准备本地底座模型。"
+MODEL_DOWNLOAD_PATTERNS = [
+    "*.json",
+    "*.safetensors",
+    "*.bin",
+    "*.pt",
+    "*.pth",
+    "*.model",
+    "*.txt",
+]
+
+
+def get_streamlit_secret(key: str, default=None):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+def get_secret_mapping(section: str) -> Mapping[str, str]:
+    value = get_streamlit_secret(section, {})
+    return value if isinstance(value, Mapping) else {}
+
+
+def get_hf_token() -> Optional[str]:
+    token = os.getenv("HF_TOKEN") or get_streamlit_secret("HF_TOKEN", "")
+    return str(token) if token else None
+
+
+def get_hf_repo_id(secret_key: str, env_key: str) -> Optional[str]:
+    repo_id = os.getenv(env_key)
+    if not repo_id:
+        repo_id = get_secret_mapping("model_repos").get(secret_key)
+    return str(repo_id).strip() if repo_id else None
+
+
+@st.cache_resource(show_spinner=False)
+def download_model_snapshot(repo_id: str) -> Path:
+    return Path(
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="model",
+            token=get_hf_token(),
+            allow_patterns=MODEL_DOWNLOAD_PATTERNS,
         )
+    )
+
+
+def resolve_model_dir(model_name: str) -> Path:
+    local_path = MODEL_PATHS[model_name]
+    if local_path.exists():
+        return local_path
+
+    spec = MODEL_SPECS[model_name]
+    repo_id = get_hf_repo_id(spec["repo_secret"], spec["repo_env"])
+    if repo_id:
+        return download_model_snapshot(repo_id)
+
+    raise FileNotFoundError(
+        f"模型目录不存在：{local_path}\n"
+        f"云端部署时，请在 Streamlit Secrets 的 [model_repos] 中配置 "
+        f"{spec['repo_secret']}，或设置环境变量 {spec['repo_env']}。"
+    )
+
+
+def resolve_base_bert_source() -> Tuple[str, bool]:
+    if LOCAL_BASE_BERT_DIR.exists():
+        return str(LOCAL_BASE_BERT_DIR), True
+
+    repo_id = get_hf_repo_id("base_bert", "HF_REPO_BASE_BERT")
+    if repo_id:
+        return str(download_model_snapshot(repo_id)), True
+
+    return PUBLIC_BASE_BERT_MODEL, False
+
+
+def get_available_model_names():
+    available = []
+    for model_name, spec in MODEL_SPECS.items():
+        has_local_model = MODEL_PATHS[model_name].exists()
+        has_remote_model = get_hf_repo_id(spec["repo_secret"], spec["repo_env"])
+        if has_local_model or has_remote_model:
+            available.append(model_name)
+    return available or list(MODEL_SPECS.keys())
 
 
 def find_weight_file(model_dir: Path) -> Path:
@@ -160,15 +261,16 @@ def find_weight_file(model_dir: Path) -> Path:
 class BertBiGRUClassifier(nn.Module):
     def __init__(
         self,
-        base_model_dir: str,
+        base_model_source: str,
+        base_local_files_only: bool,
         num_labels: int = 2,
         hidden_size: int = 256,
         dropout: float = 0.3,
     ):
         super().__init__()
         self.bert = AutoModel.from_pretrained(
-            base_model_dir,
-            local_files_only=True,
+            base_model_source,
+            local_files_only=base_local_files_only,
         )
         bert_hidden = self.bert.config.hidden_size
 
@@ -208,8 +310,7 @@ class BertBiGRUClassifier(nn.Module):
 # =========================
 # 模型加载
 # =========================
-def load_standard_model(model_name: str):
-    model_path = MODEL_PATHS[model_name]
+def load_standard_model(model_path: Path):
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path),
         use_fast=False,
@@ -224,9 +325,8 @@ def load_standard_model(model_name: str):
     return tokenizer, model, "standard"
 
 
-def load_bigru_model():
-    ensure_local_base_exists()
-    model_path = MODEL_PATHS["BERT+BiGRU"]
+def load_bigru_model(model_path: Path):
+    base_source, base_local_files_only = resolve_base_bert_source()
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(
@@ -236,13 +336,14 @@ def load_bigru_model():
         )
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained(
-            str(LOCAL_BASE_BERT_DIR),
+            base_source,
             use_fast=False,
-            local_files_only=True,
+            local_files_only=base_local_files_only,
         )
 
     model = BertBiGRUClassifier(
-        base_model_dir=str(LOCAL_BASE_BERT_DIR),
+        base_model_source=base_source,
+        base_local_files_only=base_local_files_only,
         num_labels=2,
         hidden_size=256,
         dropout=0.3,
@@ -269,9 +370,8 @@ def load_bigru_model():
     return tokenizer, model, "bigru"
 
 
-def load_lora_model():
-    ensure_local_base_exists()
-    model_path = MODEL_PATHS["BERT+LoRA"]
+def load_lora_model(model_path: Path):
+    base_source, base_local_files_only = resolve_base_bert_source()
 
     if not PEFT_AVAILABLE:
         raise RuntimeError("当前环境未安装 peft，无法加载 BERT+LoRA。")
@@ -284,15 +384,15 @@ def load_lora_model():
         )
     except Exception:
         tokenizer = AutoTokenizer.from_pretrained(
-            str(LOCAL_BASE_BERT_DIR),
+            base_source,
             use_fast=False,
-            local_files_only=True,
+            local_files_only=base_local_files_only,
         )
 
     base_model = AutoModelForSequenceClassification.from_pretrained(
-        str(LOCAL_BASE_BERT_DIR),
+        base_source,
         num_labels=2,
-        local_files_only=True,
+        local_files_only=base_local_files_only,
     )
 
     model = PeftModel.from_pretrained(
@@ -308,15 +408,13 @@ def load_lora_model():
 
 @st.cache_resource(show_spinner=False)
 def load_model_and_tokenizer(model_name: str):
-    model_path = MODEL_PATHS[model_name]
-    if not model_path.exists():
-        raise FileNotFoundError(f"模型目录不存在：{model_path}")
+    model_path = resolve_model_dir(model_name)
 
     if model_name == "BERT+BiGRU":
-        return load_bigru_model()
+        return load_bigru_model(model_path)
     if model_name == "BERT+LoRA":
-        return load_lora_model()
-    return load_standard_model(model_name)
+        return load_lora_model(model_path)
+    return load_standard_model(model_path)
 
 
 # =========================
@@ -482,14 +580,21 @@ def draw_single_stat_chart(result_df: pd.DataFrame):
 st.title("中文文本情感分类系统")
 
 st.sidebar.header("系统设置")
+model_options = get_available_model_names()
 selected_model = st.sidebar.selectbox(
     "选择模型",
-    list(MODEL_PATHS.keys()),
+    model_options,
     index=0,
 )
+st.sidebar.caption(f"运行设备：{DEVICE}")
+
+if st.sidebar.button("清理模型缓存"):
+    st.cache_resource.clear()
+    st.rerun()
 
 try:
-    load_model_and_tokenizer(selected_model)
+    with st.spinner(f"正在加载 {selected_model} 模型..."):
+        load_model_and_tokenizer(selected_model)
     st.sidebar.success(f"{selected_model} 模型加载成功")
 except Exception as e:
     st.sidebar.error(f"模型加载失败：{e}")
@@ -514,7 +619,7 @@ with tab1:
         height=180,
     )
 
-    if st.button("开始文本预测", type="primary", width="stretch"):
+    if st.button("开始文本预测", type="primary", use_container_width=True):
         if not st.session_state.single_text.strip():
             st.warning("请输入文本后再预测。")
         else:
@@ -562,7 +667,7 @@ with tab2:
                 st.error("文件读取失败，请检查编码格式。")
             else:
                 st.success("文件读取成功")
-                st.dataframe(df.head(), width="stretch")
+                st.dataframe(df.head(), use_container_width=True)
 
                 possible_text_cols = [c for c in df.columns if df[c].dtype == "object"]
                 if not possible_text_cols:
@@ -586,7 +691,7 @@ with tab2:
 
             if st.session_state.batch_result_df is not None:
                 st.markdown("### 批量预测结果")
-                st.dataframe(st.session_state.batch_result_df.head(20), width="stretch")
+                st.dataframe(st.session_state.batch_result_df.head(20), use_container_width=True)
 
                 st.markdown("### 可视化统计结果")
                 st.caption("情感分类统计图")
