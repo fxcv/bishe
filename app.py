@@ -787,12 +787,6 @@ with tab2:
                             st.warning(f"检测到 {empty_text_count} 行空文本，批量预测时会自动跳过。")
 
                         default_rows = min(valid_text_count, MAX_BATCH_ROWS)
-                        if valid_text_count > MAX_BATCH_ROWS:
-                            st.warning(
-                                f"当前文件有 {valid_text_count} 行有效文本。"
-                                f"Streamlit Cloud 资源有限，默认只预测前 {MAX_BATCH_ROWS} 行；"
-                                "本地运行可调大 SENTIMENT_MAX_BATCH_ROWS。"
-                            )
 
                         predict_rows = st.number_input(
                             "本次预测行数",
