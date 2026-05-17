@@ -5,6 +5,7 @@ import re
 import random
 import traceback
 from collections.abc import Mapping
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -145,6 +146,9 @@ if "single_text" not in st.session_state:
 if "batch_result_df" not in st.session_state:
     st.session_state.batch_result_df = None
 
+if "batch_history" not in st.session_state:
+    st.session_state.batch_history = []
+
 
 # =========================
 # 工具函数
@@ -226,6 +230,25 @@ def read_uploaded_csv(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[s
             last_error = exc
 
     return None, None, str(last_error) if last_error else "未知错误"
+
+
+def build_batch_history_record(
+    result_df: pd.DataFrame,
+    file_name: str,
+    model_name: str,
+    text_col: str,
+) -> Dict[str, object]:
+    counts = result_df["预测标签"].value_counts()
+    return {
+        "预测时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "文件名": file_name,
+        "模型": model_name,
+        "文本列": text_col,
+        "预测行数": int(len(result_df)),
+        "正向数量": int(counts.get("正向", 0)),
+        "负向数量": int(counts.get("负向", 0)),
+        "平均置信度": round(float(result_df["置信度"].mean()), 4) if not result_df.empty else 0.0,
+    }
 
 
 def label_to_text(label_id: int) -> str:
@@ -810,6 +833,20 @@ with tab2:
                                     status_text,
                                 )
                                 st.session_state.batch_result_df = result_df
+                                history_record = build_batch_history_record(
+                                    result_df,
+                                    uploaded_file.name,
+                                    selected_model,
+                                    text_col,
+                                )
+                                history_record["_result_csv"] = result_df.to_csv(
+                                    index=False,
+                                    encoding="utf-8-sig",
+                                ).encode("utf-8-sig")
+                                history_record["_result_file_name"] = (
+                                    f"batch_predict_{len(st.session_state.batch_history) + 1}.csv"
+                                )
+                                st.session_state.batch_history.append(history_record)
 
             if st.session_state.batch_result_df is not None:
                 st.markdown("### 批量预测结果")
@@ -835,3 +872,40 @@ with tab2:
             st.error(f"批量预测失败：{type(e).__name__}: {e}")
             with st.expander("查看错误详情"):
                 st.code(traceback.format_exc(), language="text")
+
+    if st.session_state.batch_history:
+        st.markdown("### 批量预测历史记录")
+        history_df = pd.DataFrame([
+            {k: v for k, v in item.items() if not k.startswith("_")}
+            for item in st.session_state.batch_history
+        ])
+        st.dataframe(history_df, use_container_width=True)
+
+        history_csv = history_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+        history_options = [
+            f"第 {index + 1} 次｜{item['文件名']}｜{item['模型']}｜{item['预测行数']} 行"
+            for index, item in enumerate(st.session_state.batch_history)
+        ]
+        selected_history = st.selectbox("选择历史预测结果", history_options)
+        selected_history_index = history_options.index(selected_history)
+        selected_history_item = st.session_state.batch_history[selected_history_index]
+
+        col1, col2, col3 = st.columns([1, 1, 1])
+        with col1:
+            st.download_button(
+                label="下载所选预测结果 CSV",
+                data=selected_history_item["_result_csv"],
+                file_name=selected_history_item["_result_file_name"],
+                mime="text/csv",
+            )
+        with col2:
+            st.download_button(
+                label="下载历史摘要 CSV",
+                data=history_csv,
+                file_name="batch_prediction_history.csv",
+                mime="text/csv",
+            )
+        with col3:
+            if st.button("清空历史记录"):
+                st.session_state.batch_history = []
+                st.rerun()
