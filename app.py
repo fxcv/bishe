@@ -149,6 +149,9 @@ if "batch_result_df" not in st.session_state:
 if "batch_history" not in st.session_state:
     st.session_state.batch_history = []
 
+if "single_history" not in st.session_state:
+    st.session_state.single_history = []
+
 
 # =========================
 # 工具函数
@@ -230,6 +233,30 @@ def read_uploaded_csv(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[s
             last_error = exc
 
     return None, None, str(last_error) if last_error else "未知错误"
+
+
+def shorten_text(text: str, max_chars: int = 80) -> str:
+    text = clean_text(text)
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}..."
+
+
+def build_single_history_record(
+    text: str,
+    model_name: str,
+    pred_label: str,
+    confidence: float,
+) -> Dict[str, object]:
+    cleaned_text = clean_text(text)
+    return {
+        "预测时间": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "模型": model_name,
+        "输入文本": shorten_text(cleaned_text),
+        "预测类别": pred_label,
+        "置信度": round(float(confidence), 4),
+        "_full_text": cleaned_text,
+    }
 
 
 def build_batch_history_record(
@@ -761,8 +788,54 @@ with tab1:
                 with col3:
                     st.metric("置信度", f"{confidence:.4f}")
 
+                st.session_state.single_history.append(
+                    build_single_history_record(
+                        st.session_state.single_text,
+                        selected_model,
+                        pred_label,
+                        confidence,
+                    )
+                )
+
             except Exception as e:
                 st.error(f"预测失败：{e}")
+
+    if st.session_state.single_history:
+        st.markdown("### 单文本预测历史记录")
+        single_history_df = pd.DataFrame([
+            {k: v for k, v in item.items() if not k.startswith("_")}
+            for item in st.session_state.single_history
+        ])
+        st.dataframe(single_history_df, use_container_width=True)
+
+        single_history_download_df = pd.DataFrame([
+            {
+                "预测时间": item["预测时间"],
+                "模型": item["模型"],
+                "输入文本": item["_full_text"],
+                "预测类别": item["预测类别"],
+                "置信度": item["置信度"],
+            }
+            for item in st.session_state.single_history
+        ])
+        single_history_csv = single_history_download_df.to_csv(
+            index=False,
+            encoding="utf-8-sig",
+        ).encode("utf-8-sig")
+
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.download_button(
+                label="全部下载 CSV",
+                data=single_history_csv,
+                file_name="single_prediction_history.csv",
+                mime="text/csv",
+                key="download_single_history",
+            )
+        with col2:
+            if st.button("清空单文本历史记录", key="clear_single_history"):
+                st.session_state.single_history = []
+                st.rerun()
 
 
 with tab2:
@@ -881,7 +954,6 @@ with tab2:
         ])
         st.dataframe(history_df, use_container_width=True)
 
-        history_csv = history_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
         history_options = [
             f"第 {index + 1} 次｜{item['文件名']}｜{item['模型']}｜{item['预测行数']} 行"
             for index, item in enumerate(st.session_state.batch_history)
@@ -890,22 +962,16 @@ with tab2:
         selected_history_index = history_options.index(selected_history)
         selected_history_item = st.session_state.batch_history[selected_history_index]
 
-        col1, col2, col3 = st.columns([1, 1, 1])
+        col1, col2 = st.columns([1, 1])
         with col1:
             st.download_button(
                 label="下载所选预测结果 CSV",
                 data=selected_history_item["_result_csv"],
                 file_name=selected_history_item["_result_file_name"],
                 mime="text/csv",
+                key="download_selected_batch_result",
             )
         with col2:
-            st.download_button(
-                label="下载历史摘要 CSV",
-                data=history_csv,
-                file_name="batch_prediction_history.csv",
-                mime="text/csv",
-            )
-        with col3:
-            if st.button("清空历史记录"):
+            if st.button("清空批量历史记录", key="clear_batch_history"):
                 st.session_state.batch_history = []
                 st.rerun()
