@@ -3,6 +3,7 @@ os.environ["TRANSFORMERS_DISABLE_AUTO_CONVERSION"] = "1"
 
 import re
 import random
+import traceback
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -12,12 +13,29 @@ import streamlit as st
 import torch
 import torch.nn as nn
 import altair as alt
+from pandas.api.types import is_object_dtype, is_string_dtype
 from huggingface_hub import snapshot_download
-from transformers import (
-    AutoTokenizer,
-    AutoModel,
-    AutoModelForSequenceClassification,
-)
+try:
+    from transformers import (
+        AutoTokenizer,
+        AutoModel,
+        AutoModelForSequenceClassification,
+    )
+except ImportError as exc:
+    st.set_page_config(page_title="Dependency error", layout="centered")
+    st.error(
+        "依赖环境不完整：`transformers` 没有正确提供 `AutoTokenizer`。"
+        "这通常是 `tokenizers` 未安装成功，或正在使用不兼容的 Python 版本。"
+    )
+    st.info("建议使用 Python 3.10-3.12 的虚拟环境重新安装依赖后再启动应用。")
+    st.code(
+        "python --version\n"
+        "python -m pip install -U -r requirements_app.txt\n"
+        "python -m streamlit run app.py",
+        language="powershell",
+    )
+    st.caption(f"原始导入错误：{exc}")
+    st.stop()
 from safetensors.torch import load_file as safe_load_file
 
 try:
@@ -25,6 +43,23 @@ try:
     PEFT_AVAILABLE = True
 except Exception:
     PEFT_AVAILABLE = False
+
+
+def get_int_setting(key: str, default: int) -> int:
+    value = os.getenv(key)
+    if value is None:
+        try:
+            value = st.secrets.get(key, None)
+        except Exception:
+            value = None
+
+    if value is None:
+        return default
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # =========================
@@ -39,6 +74,8 @@ PUBLIC_BASE_BERT_MODEL = "bert-base-chinese"
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MAX_LENGTH = 128
+BATCH_SIZE = get_int_setting("SENTIMENT_BATCH_SIZE", 8)
+MAX_BATCH_ROWS = get_int_setting("SENTIMENT_MAX_BATCH_ROWS", 300)
 
 st.set_page_config(
     page_title="中文文本情感分类系统",
@@ -122,6 +159,73 @@ def clean_text(text: str) -> str:
     text = re.sub(r"#([^#]+)#", r"\1", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+TEXT_COLUMN_NAME_HINTS = (
+    "text", "review", "content", "comment", "sentence",
+    "文本", "内容", "评论", "评价", "微博",
+)
+
+NON_TEXT_COLUMN_NAME_HINTS = (
+    "label", "target", "sentiment", "class", "category",
+    "标签", "类别", "情感",
+)
+
+
+def has_text_content(series: pd.Series, allow_short: bool = False) -> bool:
+    sample = series.dropna().head(1000)
+    if sample.empty:
+        return False
+
+    cleaned_values = [clean_text(value) for value in sample.astype(str)]
+    cleaned_values = [value for value in cleaned_values if value]
+    if not cleaned_values:
+        return False
+
+    if allow_short:
+        return True
+    return any(len(value) >= 4 for value in cleaned_values)
+
+
+def get_text_column_candidates(df: pd.DataFrame):
+    candidates = []
+    column_order = {column: index for index, column in enumerate(df.columns)}
+
+    for column in df.columns:
+        series = df[column]
+        column_name = str(column).strip().lower()
+        has_name_hint = any(hint in column_name for hint in TEXT_COLUMN_NAME_HINTS)
+        has_non_text_hint = any(hint in column_name for hint in NON_TEXT_COLUMN_NAME_HINTS)
+        dtype_looks_text = is_object_dtype(series.dtype) or is_string_dtype(series.dtype)
+
+        if has_non_text_hint and not has_name_hint:
+            continue
+        if (has_name_hint or dtype_looks_text) and has_text_content(series, allow_short=has_name_hint):
+            candidates.append(column)
+
+    def sort_key(column):
+        column_name = str(column).strip().lower()
+        exact_hint = column_name in TEXT_COLUMN_NAME_HINTS
+        partial_hint = any(hint in column_name for hint in TEXT_COLUMN_NAME_HINTS)
+        return (not exact_hint, not partial_hint, column_order[column])
+
+    return sorted(candidates, key=sort_key)
+
+
+def get_valid_text_mask(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).map(clean_text).astype(bool)
+
+
+def read_uploaded_csv(uploaded_file) -> Tuple[Optional[pd.DataFrame], Optional[str], Optional[str]]:
+    last_error = None
+    for enc in ["utf-8-sig", "utf-8", "gb18030", "gbk"]:
+        try:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding=enc), enc, None
+        except Exception as exc:
+            last_error = exc
+
+    return None, None, str(last_error) if last_error else "未知错误"
 
 
 def label_to_text(label_id: int) -> str:
@@ -464,10 +568,9 @@ def predict_batch_with_progress(
     results = []
     texts = df[text_col].fillna("").astype(str).tolist()
     total = len(texts)
-    batch_size = 32
 
-    for i in range(0, total, batch_size):
-        batch_texts = texts[i:i + batch_size]
+    for i in range(0, total, BATCH_SIZE):
+        batch_texts = texts[i:i + BATCH_SIZE]
         cleaned_batch = [clean_text(t) for t in batch_texts]
 
         inputs = tokenizer(
@@ -497,9 +600,9 @@ def predict_batch_with_progress(
                 "置信度": round(float(prob[pred_id]), 4),
             })
 
-        progress = min((i + batch_size) / total, 1.0)
+        progress = min((i + BATCH_SIZE) / total, 1.0)
         progress_bar.progress(progress)
-        status_text.text(f"正在预测：{min(i + batch_size, total)}/{total}")
+        status_text.text(f"正在预测：{min(i + BATCH_SIZE, total)}/{total}")
 
     status_text.text("批量预测完成")
     return pd.DataFrame(results)
@@ -651,40 +754,68 @@ with tab2:
 
     if uploaded_file is not None:
         try:
-            df = None
-            for enc in ["utf-8-sig", "utf-8", "gbk"]:
-                try:
-                    uploaded_file.seek(0)
-                    df = pd.read_csv(uploaded_file, encoding=enc)
-                    break
-                except Exception:
-                    continue
+            file_signature = (uploaded_file.name, getattr(uploaded_file, "size", None))
+            if st.session_state.get("batch_file_signature") != file_signature:
+                st.session_state.batch_file_signature = file_signature
+                st.session_state.batch_result_df = None
+
+            df, used_encoding, read_error = read_uploaded_csv(uploaded_file)
 
             if df is None:
                 st.error("文件读取失败，请检查编码格式。")
+                if read_error:
+                    st.caption(f"读取错误：{read_error}")
+            elif df.empty:
+                st.error("CSV 文件为空，请上传包含文本数据的文件。")
             else:
-                st.success("文件读取成功")
+                st.success(f"文件读取成功，共 {len(df)} 行，编码：{used_encoding}")
                 st.dataframe(df.head(), use_container_width=True)
 
-                possible_text_cols = [c for c in df.columns if df[c].dtype == "object"]
+                possible_text_cols = get_text_column_candidates(df)
                 if not possible_text_cols:
                     st.error("未找到可用文本列，请确保 CSV 中包含文本列。")
                 else:
                     text_col = st.selectbox("选择文本列", possible_text_cols)
+                    valid_text_mask = get_valid_text_mask(df[text_col])
+                    valid_text_count = int(valid_text_mask.sum())
+                    empty_text_count = int(len(df) - valid_text_count)
 
-                    if st.button("开始批量预测", type="primary"):
-                        progress_bar = st.progress(0)
-                        status_text = st.empty()
+                    if valid_text_count == 0:
+                        st.error("所选文本列没有可预测的有效文本。")
+                    else:
+                        if empty_text_count > 0:
+                            st.warning(f"检测到 {empty_text_count} 行空文本，批量预测时会自动跳过。")
 
-                        with st.spinner("正在进行批量预测，请稍候..."):
-                            result_df = predict_batch_with_progress(
-                                df,
-                                text_col,
-                                selected_model,
-                                progress_bar,
-                                status_text,
+                        default_rows = min(valid_text_count, MAX_BATCH_ROWS)
+                        if valid_text_count > MAX_BATCH_ROWS:
+                            st.warning(
+                                f"当前文件有 {valid_text_count} 行有效文本。"
+                                f"Streamlit Cloud 资源有限，默认只预测前 {MAX_BATCH_ROWS} 行；"
+                                "本地运行可调大 SENTIMENT_MAX_BATCH_ROWS。"
                             )
-                            st.session_state.batch_result_df = result_df
+
+                        predict_rows = st.number_input(
+                            "本次预测行数",
+                            min_value=1,
+                            max_value=valid_text_count,
+                            value=default_rows,
+                            step=1,
+                        )
+
+                        if st.button("开始批量预测", type="primary"):
+                            progress_bar = st.progress(0)
+                            status_text = st.empty()
+                            predict_df = df.loc[valid_text_mask].head(int(predict_rows)).copy()
+
+                            with st.spinner("正在进行批量预测，请稍候..."):
+                                result_df = predict_batch_with_progress(
+                                    predict_df,
+                                    text_col,
+                                    selected_model,
+                                    progress_bar,
+                                    status_text,
+                                )
+                                st.session_state.batch_result_df = result_df
 
             if st.session_state.batch_result_df is not None:
                 st.markdown("### 批量预测结果")
@@ -707,4 +838,6 @@ with tab2:
                 )
 
         except Exception as e:
-            st.error(f"批量预测失败：{e}")
+            st.error(f"批量预测失败：{type(e).__name__}: {e}")
+            with st.expander("查看错误详情"):
+                st.code(traceback.format_exc(), language="text")
